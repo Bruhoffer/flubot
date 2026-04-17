@@ -1,5 +1,6 @@
 """Graphviz Stock & Flow diagram renderer for the Flu Dynamics Tutor."""
 
+import re
 from typing import Sequence
 
 import graphviz
@@ -53,8 +54,25 @@ def render_sfd(
         )
         return dot
 
-    # ── Stocks ─────────────────────────────────────────────────────────────────
+    # ── Pre-compute lookup tables ──────────────────────────────────────────────
     stock_names = {s["name"] for s in stocks}
+    param_names = {p["name"] for p in parameters}
+
+    # flow name → valve node id (built during flow rendering below)
+    flow_valve_ids: dict[str, str] = {
+        f["name"]: f"valve_{i}_{f['name'].replace(' ', '_')}"
+        for i, f in enumerate(flows)
+    }
+
+    # flows that have at least one parameter feeding into them (equation discussion started)
+    flows_with_params: set[str] = {
+        target
+        for p in parameters
+        for target in (p.get("feeds_into") or [])
+        if target in flow_valve_ids
+    }
+
+    # ── Stocks ─────────────────────────────────────────────────────────────────
     for s in stocks:
         iv = s.get("initial_value")
         label = f'{s["name"]}\n({int(iv) if iv is not None and iv == int(iv) else iv} {s.get("unit", "People")})' if iv is not None else s["name"]
@@ -91,15 +109,33 @@ def render_sfd(
         src = f.get("from_stock")
         tgt = f.get("to_stock")
         # Arrow from source stock (or cloud) → valve → target stock (or cloud)
+        # Polarity: outflow from stock = "−", inflow to stock = "+"
         if src and src in stock_names:
             dot.edge(
                 src, valve_id,
                 penwidth="3",
                 color="#92400e",
                 arrowhead="none",
+                label="  −",
+                fontcolor="#dc2626",
+                fontsize="12",
+                fontname="Helvetica Bold",
             )
+            # Causal dashed arrow: only once parameters feed into this flow
+            if f["name"] in flows_with_params:
+                dot.edge(
+                    src, valve_id,
+                    style="dashed",
+                    color="#94a3b8",
+                    arrowsize="0.7",
+                    penwidth="1.0",
+                    label="  +",
+                    fontcolor="#16a34a",
+                    fontsize="11",
+                    fontname="Helvetica Bold",
+                    constraint="false",
+                )
         else:
-            # Source cloud
             cloud_id = f"cloud_src_{i}"
             dot.node(cloud_id, "☁", shape="plaintext", fontsize="16", fontcolor="#94a3b8")
             dot.edge(cloud_id, valve_id, penwidth="3", color="#92400e", arrowhead="none")
@@ -111,6 +147,10 @@ def render_sfd(
                 color="#92400e",
                 arrowhead="normal",
                 arrowsize="1.2",
+                label="  +",
+                fontcolor="#16a34a",
+                fontsize="12",
+                fontname="Helvetica Bold",
             )
         else:
             cloud_id = f"cloud_tgt_{i}"
@@ -146,19 +186,43 @@ def render_sfd(
             fontcolor="#1e293b",
         )
 
-    # ── Loop labels ────────────────────────────────────────────────────────────
-    if loops:
-        for lp in loops:
-            loop_type = lp.get("loop_type", "balancing")
-            color = "#16a34a" if loop_type == "reinforcing" else "#dc2626"
-            symbol = "R" if loop_type == "reinforcing" else "B"
-            dot.node(
-                f'loop_{lp["name"]}',
-                f'{lp["name"]} ({symbol})',
-                shape="plaintext",
-                fontcolor=color,
-                fontsize="10",
-                fontname="Helvetica Bold",
+        # Outbound edges: param/auxiliary → flow valves or other auxiliaries
+        # Auxiliaries (have an equation) get a "+" polarity label; constants do not
+        is_auxiliary = bool(p.get("equation"))
+        for target in (p.get("feeds_into") or []):
+            dest = flow_valve_ids.get(target, target)
+            edge_attrs: dict = dict(
+                style="dashed",
+                color="#64748b",
+                arrowsize="0.7",
+                penwidth="1.2",
             )
+            if is_auxiliary:
+                edge_attrs.update(
+                    label="  +",
+                    fontcolor="#16a34a",
+                    fontsize="11",
+                    fontname="Helvetica Bold",
+                )
+            dot.edge(p["name"], dest, **edge_attrs)
+
+        # Inbound edges: parse equation to find which stocks/params feed INTO this auxiliary
+        # All equation inputs get a "+" causal label
+        if p.get("equation"):
+            tokens = re.split(r"[\s+\-*/()]+", p["equation"])
+            for tok in tokens:
+                tok = tok.strip()
+                if tok and (tok in stock_names or tok in param_names) and tok != p["name"]:
+                    dot.edge(
+                        tok, p["name"],
+                        style="dashed",
+                        color="#64748b",
+                        arrowsize="0.7",
+                        penwidth="1.2",
+                        label="  +",
+                        fontcolor="#16a34a",
+                        fontsize="11",
+                        fontname="Helvetica Bold",
+                    )
 
     return dot

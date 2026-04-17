@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS flu_sessions (
     session_outcome     JSONB,
     transcript          TEXT,
     cld_dot             TEXT,
-    quiz_results        JSONB
+    quiz_results        JSONB,
+    bot_results         JSONB,
+    survey_results      JSONB
 );
 
 -- 2. Dedicated turns table for the flu tutor
@@ -37,6 +39,9 @@ CREATE TABLE IF NOT EXISTS flu_turns (
     snapshot_parameters     JSONB,
     snapshot_loops          JSONB
 );
+
+-- If the table already exists, add the new column:
+ALTER TABLE flu_sessions ADD COLUMN IF NOT EXISTS bot_results JSONB;
 
 -- 3. Indexes
 CREATE INDEX IF NOT EXISTS idx_flu_sessions_student

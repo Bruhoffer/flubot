@@ -182,6 +182,46 @@ def save_quiz_results(session_id: str, results: dict) -> None:
         conn.close()
 
 
+def save_bot_results(session_id: str, results: dict) -> None:
+    """Persist BOT question results progressively (called after each correct answer).
+
+    results is a dict keyed by question index:
+        {0: {question, attempts, correct: True}, ...}
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE flu_sessions SET bot_results = %s WHERE id = %s",
+                (json.dumps(results), session_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_survey(session_id: str, survey: dict) -> None:
+    """Persist post-session survey responses to flu_sessions.survey_results (jsonb).
+
+    Overwrites the entire column each call — safe because callers always pass
+    the full accumulated dict from session state.
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE flu_sessions SET survey_results = %s WHERE id = %s",
+                (json.dumps(survey), session_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Alias used for progressive per-step saves
+save_survey_partial = save_survey
+
+
 def log_turn(
     session_id: str,
     turn_number: int,

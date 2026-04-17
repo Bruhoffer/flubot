@@ -16,7 +16,7 @@ _I0 = 1          # initial infected
 _N  = 600        # total population (constant)
 _c  = 10         # avg contacts per month
 _β  = 0.65       # transmission coefficient per contact
-_τ  = 1 / 3      # recovery duration in months (~9 days ≈ 0.33 months)
+_τ  = 0.33       # recovery duration in months (~9 days / 30 days per reference)
 
 
 def simulate(

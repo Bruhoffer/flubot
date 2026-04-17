@@ -8,7 +8,7 @@ _CANONICAL_LOOPS: list[tuple[str, str, set[str]]] = [
         "infected", "probability of meeting infected", "infection rate",
     }),
     ("B1", "balancing", {
-        "susceptible", "infected", "infection rate",
+        "susceptible", "infection rate",
     }),
     ("B2", "balancing", {
         "infected", "recovery rate",

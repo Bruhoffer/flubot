@@ -2,26 +2,30 @@
 
 import html as html_lib
 import threading
+import uuid
+from pathlib import Path
+
+_APP_DIR = Path(__file__).parent
 
 import plotly.graph_objects as go
 import streamlit as st
 
 from assess import get_pre_assessment_extraction, score_assessment
 from guardrails import apply_tutor_response
-from llm import get_tutor_response
+from llm import evaluate_bot_answer, get_tutor_response
 from logger import (
-    get_latest_session,
     init_session,
-    load_session_state,
     log_turn,
+    save_bot_results,
     save_pre_assessment,
     save_pre_assessment_raw,
     save_quiz_results,
     save_session_outcome,
     save_session_transcript,
+    save_survey,
 )
 from models import CASE_STUDY
-from quiz import QUESTIONS, TOTAL_QUESTIONS
+from quiz import BOT_QUESTIONS, QUESTIONS, TOTAL_BOT, TOTAL_QUESTIONS
 from render import render_sfd
 from simulation import peak_infected, simulate
 
@@ -41,18 +45,19 @@ st.markdown(
         max-width: 100% !important;
     }
     .top-bar {
-        display: flex;
+        display: inline-flex;
         align-items: center;
-        gap: 18px;
+        gap: 14px;
         background: #1e293b;
         color: #e2e8f0;
         border-radius: 8px;
-        padding: 7px 16px;
-        font-size: 0.8rem;
+        padding: 5px 12px;
+        font-size: 0.78rem;
         margin-bottom: 10px;
         flex-wrap: wrap;
+        max-width: 320px;
     }
-    .top-bar .label { color: #94a3b8; margin-right: 3px; }
+.top-bar .label { color: #94a3b8; margin-right: 3px; }
     .top-bar .value { font-weight: 600; color: #f1f5f9; }
     .top-bar .tag {
         background: #334155;
@@ -67,7 +72,7 @@ st.markdown(
         border: 1px solid #1e3a5f;
         border-radius: 8px;
         padding: 10px 16px;
-        font-size: 0.81rem;
+        font-size: 0.9rem;
         line-height: 1.6;
         color: #cbd5e1;
         max-height: 100px;
@@ -157,76 +162,47 @@ _defaults = {
     "log_error": None,
     "session_id": None,
     "student_id": None,
-    "_pending_student_id": None,
-    "resume_candidate": None,
     "phase": "pre_assessment",
     "quiz_question_idx": 0,
     "quiz_answers": {},
     "quiz_saved": False,
+    "quiz_started": False,
+    # BOT state
+    "bot_question_idx": 0,
+    "bot_messages": [],
+    "bot_correct": False,
+    "bot_evaluating": False,
+    "bot_attempts": {},
+    "bot_results": {},
+    # Misc
+    "confirm_finish": False,
+    "survey_saved": False,
+    "survey_step": 0,
+    "survey_data": {},
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── Student ID gate ───────────────────────────────────────────────────────────
-if not st.session_state.student_id or not st.session_state.session_id:
-    st.title("Flu Dynamics S&F Tutor")
+# ── Anonymous ID (Python-only, no JS required) ───────────────────────────────
+# On first visit: generate a short random ID, write it into the URL query param,
+# and rerun — the URL becomes ?anon_id=anon-xxxxxx.
+# On every subsequent visit/rerun the param is already in the URL and we just read it.
+# Bookmarking the URL with the param preserves the same ID across browser sessions.
+if "anon_id" not in st.query_params:
+    st.query_params["anon_id"] = "anon-" + uuid.uuid4().hex[:6]
+    st.rerun()
 
-    if st.session_state.resume_candidate is None:
-        st.markdown("Enter your student ID to begin.")
-        with st.form("student_id_form"):
-            sid = st.text_input("Student ID (e.g. A0123456X)")
-            submitted = st.form_submit_button("Start Session")
-        if submitted and sid.strip():
-            try:
-                candidate = get_latest_session(sid.strip())
-                st.session_state._pending_student_id = sid.strip()
-                if candidate:
-                    st.session_state.resume_candidate = candidate
-                else:
-                    session_id = init_session(sid.strip())
-                    st.session_state.student_id = sid.strip()
-                    st.session_state.session_id = session_id
-                    st.session_state.resume_candidate = False
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not connect to database: {e}")
+_anon_id = st.query_params["anon_id"]
 
-    elif isinstance(st.session_state.resume_candidate, dict):
-        candidate = st.session_state.resume_candidate
-        sid = st.session_state._pending_student_id
-        last_seen = candidate.get("last_active")
-        last_seen_str = str(last_seen)[:16] if last_seen else "unknown"
-        st.info(f"A previous session was found for **{sid}** (last active: {last_seen_str}).")
-        col_r, col_n = st.columns(2)
-        with col_r:
-            if st.button("Resume last session", type="primary", use_container_width=True):
-                try:
-                    state = load_session_state(candidate["id"])
-                    st.session_state.student_id = sid
-                    st.session_state.session_id = candidate["id"]
-                    st.session_state.messages = state["messages"]
-                    st.session_state.stocks = state["stocks"]
-                    st.session_state.flows = state["flows"]
-                    st.session_state.parameters = state["parameters"]
-                    st.session_state.loops = state["loops"]
-                    st.session_state.resume_candidate = False
-                    st.session_state.phase = "tutoring"
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not load session: {e}")
-        with col_n:
-            if st.button("Start new session", use_container_width=True):
-                try:
-                    session_id = init_session(sid)
-                    st.session_state.student_id = sid
-                    st.session_state.session_id = session_id
-                    st.session_state.resume_candidate = False
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not start new session: {e}")
-
-    st.stop()
+# Initialise student_id + session once per Streamlit session (or after reset)
+if not st.session_state.student_id:
+    st.session_state.student_id = _anon_id
+    try:
+        st.session_state.session_id = init_session(_anon_id)
+    except Exception as e:
+        st.error(f"Could not connect to database: {e}")
+        st.stop()
 
 # ── Pre-assessment phase ──────────────────────────────────────────────────────
 if st.session_state.phase == "pre_assessment":
@@ -310,8 +286,12 @@ if st.session_state.phase == "pre_assessment":
     st.stop()
 
 # ── Quiz phase ────────────────────────────────────────────────────────────────
-if st.session_state.phase == "quiz":
+if st.session_state.phase == "quiz_mcq":
     st.title("What did we learn? — The 'Limits to Growth' Archetype")
+
+    if st.button("← Back to Chat"):
+        st.session_state.phase = "tutoring"
+        st.rerun()
 
     idx = st.session_state.quiz_question_idx
 
@@ -321,25 +301,6 @@ if st.session_state.phase == "quiz":
             for q_idx, ans in st.session_state.quiz_answers.items()
             if ans == QUESTIONS[q_idx]["answer"]
         )
-
-        if not st.session_state.quiz_saved:
-            try:
-                answer_log = [
-                    {
-                        "question": QUESTIONS[q_idx]["question"],
-                        "selected": QUESTIONS[q_idx]["options"][ans],
-                        "correct_answer": QUESTIONS[q_idx]["options"][QUESTIONS[q_idx]["answer"]],
-                        "is_correct": ans == QUESTIONS[q_idx]["answer"],
-                    }
-                    for q_idx, ans in st.session_state.quiz_answers.items()
-                ]
-                save_quiz_results(
-                    st.session_state.session_id,
-                    {"score": correct, "total": TOTAL_QUESTIONS, "answers": answer_log},
-                )
-                st.session_state.quiz_saved = True
-            except Exception:
-                pass
 
         if correct == TOTAL_QUESTIONS:
             st.success(f"Perfect score — {correct}/{TOTAL_QUESTIONS}!")
@@ -365,8 +326,8 @@ if st.session_state.phase == "quiz":
             "before B1 can do its work."
         )
 
-        if st.button("← Return to my diagram", type="primary"):
-            st.session_state.phase = "tutoring"
+        if st.button("Continue →", type="primary"):
+            st.session_state.phase = "quiz_bot"
             st.rerun()
         st.stop()
 
@@ -388,7 +349,29 @@ if st.session_state.phase == "quiz":
 
     if not already_answered:
         if st.button("Submit answer", type="primary", disabled=(selected is None)):
-            st.session_state.quiz_answers[idx] = q["options"].index(selected)
+            ans_idx = q["options"].index(selected)
+            st.session_state.quiz_answers[idx] = ans_idx
+            # Persist the running answer set immediately (per-answer save)
+            try:
+                answer_log = [
+                    {
+                        "question": QUESTIONS[q_idx]["question"],
+                        "selected": QUESTIONS[q_idx]["options"][a],
+                        "correct_answer": QUESTIONS[q_idx]["options"][QUESTIONS[q_idx]["answer"]],
+                        "is_correct": a == QUESTIONS[q_idx]["answer"],
+                    }
+                    for q_idx, a in st.session_state.quiz_answers.items()
+                ]
+                correct_so_far = sum(
+                    1 for q_idx, a in st.session_state.quiz_answers.items()
+                    if a == QUESTIONS[q_idx]["answer"]
+                )
+                save_quiz_results(
+                    st.session_state.session_id,
+                    {"score": correct_so_far, "total": TOTAL_QUESTIONS, "answers": answer_log},
+                )
+            except Exception:
+                pass
             st.rerun()
     else:
         student_ans = st.session_state.quiz_answers[idx]
@@ -399,10 +382,201 @@ if st.session_state.phase == "quiz":
             st.error(f"Not quite. The correct answer: **{q['options'][correct_ans]}**")
         st.info(f"**Why:** {q['explanation']}")
 
+        # Question 4 (idx 3) — show the Limits to Growth archetype diagram
+        if idx == 3:
+            img_path = _APP_DIR / "limitstogrowth.jpg"
+            if img_path.exists():
+                st.image(str(img_path), caption="The 'Limits to Growth' archetype", use_container_width=True)
+
         label = "Next question →" if idx < TOTAL_QUESTIONS - 1 else "See results →"
         if st.button(label, type="primary"):
             st.session_state.quiz_question_idx += 1
             st.rerun()
+
+    st.stop()
+
+# ── Quiz BOT phase (chat-based Behaviour Over Time) ──────────────────────────
+if st.session_state.phase == "quiz_bot":
+    nav_left, nav_right = st.columns([1, 1])
+    with nav_left:
+        if st.button("← Back to Chat", key="back_bot"):
+            st.session_state.phase = "tutoring"
+            st.rerun()
+    with nav_right:
+        if st.button("Skip to Feedback →", key="skip_to_feedback"):
+            st.session_state.phase = "survey"
+            st.rerun()
+
+    bot_idx = st.session_state.bot_question_idx
+
+    if bot_idx >= TOTAL_BOT:
+        # All BOT questions done
+        st.title("Reflection Complete")
+        st.success(
+            f"You answered all {TOTAL_BOT} Behaviour Over Time questions. "
+            "Great systems thinking!"
+        )
+        st.markdown(
+            "### Key Takeaway\n"
+            "In the RC4 flu model, **timing** is everything. R1 drives explosive early "
+            "growth, but B1 (susceptible depletion) and B2 (recovery) gradually neutralise "
+            "it — producing the S-shaped endemic equilibrium. Tracing *how* each variable "
+            "behaves over time reveals *why* the system reaches a steady state rather than "
+            "burning out to zero.\n\n"
+            "**The policy insight:** intervening on R1 early (reducing contact rate) "
+            "is far more effective than waiting for B1 and B2 to do the work."
+        )
+        if st.button("Continue to Feedback →", type="primary"):
+            st.session_state.phase = "survey"
+            st.rerun()
+        st.stop()
+
+    total_all = TOTAL_QUESTIONS + TOTAL_BOT
+    global_idx = TOTAL_QUESTIONS + bot_idx
+    st.title("Part 2 — Behaviour Over Time")
+    st.progress(global_idx / total_all, text=f"Question {global_idx + 1} of {total_all}")
+
+    bot_q = BOT_QUESTIONS[bot_idx]
+    st.markdown(f"#### Question {global_idx + 1}")
+    st.markdown(bot_q["question"])
+
+    chat_container = st.container(height=320)
+    with chat_container:
+        for msg in st.session_state.bot_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+    if st.session_state.bot_correct:
+        st.success("You've got it! ✓")
+        label = "Next question →" if bot_idx < TOTAL_BOT - 1 else "See reflection →"
+        if st.button(label, type="primary"):
+            st.session_state.bot_question_idx += 1
+            st.session_state.bot_messages = []
+            st.session_state.bot_correct = False
+            st.session_state.bot_evaluating = False
+            st.rerun()
+    else:
+        if user_input := st.chat_input("Type your answer...", key="bot_chat_input"):
+            st.session_state.bot_messages.append({"role": "user", "content": user_input})
+            st.session_state.bot_evaluating = True
+            st.session_state.bot_attempts[bot_idx] = (
+                st.session_state.bot_attempts.get(bot_idx, 0) + 1
+            )
+            st.rerun()
+
+    if st.session_state.bot_evaluating:
+        try:
+            result = evaluate_bot_answer(
+                question=bot_q["question"],
+                reference_answer=bot_q["reference_answer"],
+                chat_history=st.session_state.bot_messages,
+                minimum_criteria=bot_q.get("minimum_criteria", ""),
+            )
+            st.session_state.bot_messages.append(
+                {"role": "assistant", "content": result.feedback}
+            )
+            st.session_state.bot_correct = result.is_correct
+            if result.is_correct:
+                st.session_state.bot_results[bot_idx] = {
+                    "question": bot_q["question"],
+                    "attempts": st.session_state.bot_attempts.get(bot_idx, 1),
+                    "correct": True,
+                }
+                try:
+                    save_bot_results(st.session_state.session_id, st.session_state.bot_results)
+                except Exception:
+                    pass
+        except Exception as e:
+            st.session_state.bot_messages.append(
+                {"role": "assistant", "content": f"Sorry, evaluation failed: {e}. Please try again."}
+            )
+        st.session_state.bot_evaluating = False
+        st.rerun()
+
+    st.stop()
+
+# ── Survey phase (single page) ────────────────────────────────────────────────
+if st.session_state.phase == "survey":
+    if st.button("← Back to Chat", key="back_survey"):
+        st.session_state.phase = "tutoring"
+        st.rerun()
+
+    if st.session_state.survey_saved:
+        st.title("Thank you!")
+        st.balloons()
+        st.markdown(
+            "Your feedback has been submitted. Thank you for participating!\n\n"
+            "You may now close this tab, or return to review your diagram."
+        )
+        if st.button("← Return to my diagram", type="primary"):
+            st.session_state.phase = "tutoring"
+            st.rerun()
+        st.stop()
+
+    st.title("Session Feedback")
+    st.markdown(
+        "Thank you for completing the session! Your feedback helps improve the tutor. "
+        "All responses are anonymous."
+    )
+
+    _SCALE = ["1 — Not at all", "2 — A little", "3 — Moderately",
+              "4 — Quite a lot", "5 — Very much"]
+
+    with st.form("survey_form"):
+        learning_points = st.text_area(
+            "What are your key learning points from this session?",
+            height=120,
+            placeholder="e.g. I learned how reinforcing and balancing loops interact to produce S-shaped growth...",
+        )
+
+        st.markdown("##### Ratings")
+        r_col1, r_col2, r_col3 = st.columns(3)
+        with r_col1:
+            llm_help = st.radio(
+                "How much did the tutor help you learn?",
+                options=_SCALE, index=None, key="sv_r1",
+            )
+        with r_col2:
+            junior_seminar = st.radio(
+                "Does it aid understanding of Junior Seminar courses?",
+                options=_SCALE, index=None, key="sv_r2",
+            )
+        with r_col3:
+            fundamentals = st.radio(
+                "Did it help with System Dynamics fundamentals?",
+                options=_SCALE, index=None, key="sv_r3",
+            )
+
+        strength = st.text_area(
+            "What do you think is the strength of this LLM tutor?",
+            height=90,
+            placeholder="e.g. It guides without giving away answers...",
+        )
+        improvement = st.text_area(
+            "What is something that could be improved?",
+            height=90,
+            placeholder="e.g. Sometimes the questions felt repetitive...",
+        )
+
+        submitted = st.form_submit_button(
+            "Submit Feedback", type="primary", use_container_width=True
+        )
+
+    if submitted:
+        survey_data = {
+            "learning_points": learning_points.strip(),
+            "llm_helpfulness": int(llm_help[0]) if llm_help else None,
+            "junior_seminar_understanding": int(junior_seminar[0]) if junior_seminar else None,
+            "sd_fundamentals_understanding": int(fundamentals[0]) if fundamentals else None,
+            "strength": strength.strip(),
+            "improvement": improvement.strip(),
+        }
+        try:
+            save_survey(st.session_state.session_id, survey_data)
+        except Exception:
+            pass
+        st.session_state.survey_saved = True
+        st.rerun()
 
     st.stop()
 
@@ -415,62 +589,98 @@ sfd = render_sfd(
 )
 
 # ── Top bar ───────────────────────────────────────────────────────────────────
-info_left, info_right = st.columns([5, 1])
+info_left, info_right = st.columns([1, 2])
 with info_left:
-    short_session = str(st.session_state.session_id)[:8] + "..."
-    safe_sid = html_lib.escape(st.session_state.student_id)
+    safe_student_id = html_lib.escape(str(st.session_state.student_id or ""))
     safe_log_error = html_lib.escape(str(st.session_state.log_error)) if st.session_state.log_error else ""
     st.markdown(
-        f'<div class="top-bar">'
-        f'<span><span class="label">Student</span>'
-        f'<span class="value">{safe_sid}</span></span>'
-        f'<span><span class="label">Session</span>'
-        f'<span class="tag">{short_session}</span></span>'
-        + (f'<span style="color:#f87171;font-size:0.75rem">⚠ Logging error: {safe_log_error}</span>'
+        f'<div style="display:inline-flex;align-items:center;gap:8px;'
+        f'background:#1e293b;border-radius:6px;padding:5px 12px;font-size:0.78rem;">'
+        f'<span style="color:#94a3b8">Your ID</span>'
+        f'<span style="background:#334155;border-radius:4px;padding:1px 7px;'
+        f'font-family:monospace;font-size:0.73rem;color:#7dd3fc">{safe_student_id}</span>'
+        + (f'<span style="color:#f87171;font-size:0.72rem">⚠ {safe_log_error}</span>'
            if safe_log_error else '')
         + '</div>',
         unsafe_allow_html=True,
     )
 with info_right:
-    btn_finish, btn_reset = st.columns(2)
-    with btn_finish:
-        if st.button("Finish →", use_container_width=True,
-                     help="End session and go to the archetype quiz"):
-            try:
-                outcome = score_assessment(
-                    st.session_state.stocks,
-                    st.session_state.flows,
-                    st.session_state.parameters,
-                    st.session_state.loops,
-                )
-                save_session_outcome(st.session_state.session_id, outcome)
-            except Exception:
-                pass
-            try:
-                transcript_lines = []
-                for m in st.session_state.messages:
-                    role = "You" if m["role"] == "user" else "Tutor"
-                    transcript_lines.append(f"[{role}]\n{m['content']}\n")
-                save_session_transcript(
-                    st.session_state.session_id,
-                    "\n".join(transcript_lines),
-                    sfd.source,
-                )
-            except Exception:
-                pass
-            st.session_state.phase = "quiz"
-            st.rerun()
-    with btn_reset:
-        if st.button("Reset", type="primary", use_container_width=True):
-            for key in ["messages", "stocks", "flows", "parameters", "loops", "guardrail_errors"]:
-                st.session_state[key] = []
-            st.session_state.session_id = None
-            st.session_state.student_id = None
-            st.session_state.phase = "pre_assessment"
-            st.session_state.quiz_question_idx = 0
-            st.session_state.quiz_answers = {}
-            st.session_state.quiz_saved = False
-            st.rerun()
+    if st.session_state.quiz_started:
+        # Already entered quiz — smart-route back to the right sub-phase
+        if st.session_state.quiz_question_idx < TOTAL_QUESTIONS:
+            dest = "quiz_mcq"
+        elif st.session_state.bot_question_idx < TOTAL_BOT:
+            dest = "quiz_bot"
+        else:
+            dest = "survey"
+        btn_back, btn_reset = st.columns(2)
+        with btn_back:
+            if st.button("Back to Quiz →", use_container_width=True, type="primary"):
+                st.session_state.phase = dest
+                st.rerun()
+        with btn_reset:
+            if st.button("Reset", use_container_width=True):
+                for k in _defaults:
+                    st.session_state[k] = _defaults[k]
+                st.session_state.session_id = None
+                st.session_state.student_id = None
+                st.rerun()
+    elif st.session_state.confirm_finish:
+        # Inline confirmation: label | Yes | No
+        c_lbl, c_yes, c_no = st.columns([1.4, 1, 1])
+        with c_lbl:
+            st.markdown(
+                '<span style="font-size:0.75rem;color:#fbbf24;white-space:nowrap">'
+                '⚠ End session?</span>',
+                unsafe_allow_html=True,
+            )
+        with c_yes:
+            if st.button("Yes", type="primary", use_container_width=True):
+                try:
+                    outcome = score_assessment(
+                        st.session_state.stocks,
+                        st.session_state.flows,
+                        st.session_state.parameters,
+                        st.session_state.loops,
+                    )
+                    save_session_outcome(st.session_state.session_id, outcome)
+                except Exception:
+                    pass
+                try:
+                    transcript_lines = []
+                    for m in st.session_state.messages:
+                        role = "You" if m["role"] == "user" else "Tutor"
+                        transcript_lines.append(f"[{role}]\n{m['content']}\n")
+                    save_session_transcript(
+                        st.session_state.session_id,
+                        "\n".join(transcript_lines),
+                        sfd.source,
+                    )
+                except Exception:
+                    pass
+                st.session_state.confirm_finish = False
+                st.session_state.quiz_started = True
+                st.session_state.phase = "quiz_mcq"
+                st.rerun()
+        with c_no:
+            if st.button("No", use_container_width=True):
+                st.session_state.confirm_finish = False
+                st.rerun()
+    else:
+        # Normal state — Finish + Reset side by side
+        btn_finish, btn_reset = st.columns(2)
+        with btn_finish:
+            if st.button("Finish →", use_container_width=True, type="primary",
+                         help="End session and go to the archetype quiz"):
+                st.session_state.confirm_finish = True
+                st.rerun()
+        with btn_reset:
+            if st.button("Reset", use_container_width=True):
+                for k in _defaults:
+                    st.session_state[k] = _defaults[k]
+                st.session_state.session_id = None
+                st.session_state.student_id = None
+                st.rerun()
 
 # ── Case study banner ─────────────────────────────────────────────────────────
 st.markdown(
@@ -521,8 +731,10 @@ with diagram_col:
             st.plotly_chart(fig, use_container_width=True)
             st.caption(
                 f"Peak infected: **{peak_i:.0f} people** at month **{peak_t:.1f}**. "
-                "Notice the bell-curve shape — rapid growth (R1) then decline as "
-                "susceptibles are exhausted (B1). This is 'Limits to Growth'."
+                "Notice the S-shaped curve for INFECTED — rapid exponential growth "
+                "driven by R1, then levelling off as B1 (susceptible depletion) and "
+                "B2 (recovery) neutralise the reinforcing loop. "
+                "This is the 'Limits to Growth' archetype."
             )
 
     # ── Export ───────────────────────────────────────────────────────────────
@@ -564,18 +776,28 @@ with diagram_col:
 # ── Right column: model elements ──────────────────────────────────────────────
 with info_col:
     stocks_html = ""
+    def _count_badge(n: int, color: str) -> str:
+        if n == 0:
+            return ""
+        return (
+            f'<span style="margin-left:6px;background:{color}22;color:{color};'
+            f'border-radius:10px;padding:1px 7px;font-size:0.68rem;font-weight:700">'
+            f'{n}</span>'
+        )
+
     if st.session_state.stocks:
         for s in st.session_state.stocks:
             iv = s.get("initial_value")
             iv_str = f" = {int(iv)}" if iv is not None else ""
             stocks_html += (
-                f'<div style="font-size:0.8rem;padding:3px 0;'
+                f'<div style="font-size:0.82rem;padding:4px 0;'
                 f'border-bottom:1px solid #e2e8f020;color:#e2e8f0">'
                 f'<b style="color:#93c5fd">{html_lib.escape(s["name"])}</b>'
-                f'{html_lib.escape(iv_str)} {html_lib.escape(s.get("unit","People"))}</div>'
+                f'<span style="color:#94a3b8;font-size:0.75rem">'
+                f'{html_lib.escape(iv_str)} {html_lib.escape(s.get("unit","People"))}</span></div>'
             )
     else:
-        stocks_html = '<div style="font-size:0.78rem;color:#64748b">No stocks identified yet.</div>'
+        stocks_html = '<div style="font-size:0.78rem;color:#475569;font-style:italic">None yet</div>'
 
     flows_html = ""
     if st.session_state.flows:
@@ -583,13 +805,13 @@ with info_col:
             src = html_lib.escape(f.get("from_stock") or "☁")
             tgt = html_lib.escape(f.get("to_stock") or "☁")
             flows_html += (
-                f'<div style="font-size:0.78rem;padding:3px 0;'
+                f'<div style="font-size:0.82rem;padding:4px 0;'
                 f'border-bottom:1px solid #e2e8f020;color:#e2e8f0">'
                 f'<b style="color:#fbbf24">{html_lib.escape(f["name"])}</b> '
-                f'<span style="color:#64748b;font-size:0.72rem">{src} → {tgt}</span></div>'
+                f'<span style="color:#64748b;font-size:0.73rem">{src} → {tgt}</span></div>'
             )
     else:
-        flows_html = '<div style="font-size:0.78rem;color:#64748b">No flows identified yet.</div>'
+        flows_html = '<div style="font-size:0.78rem;color:#475569;font-style:italic">None yet</div>'
 
     params_html = ""
     if st.session_state.parameters:
@@ -598,13 +820,13 @@ with info_col:
             eq = p.get("equation")
             detail = f" = {val}" if val is not None else (f" = {eq}" if eq else "")
             params_html += (
-                f'<div style="font-size:0.78rem;padding:3px 0;'
+                f'<div style="font-size:0.82rem;padding:4px 0;'
                 f'border-bottom:1px solid #e2e8f020;color:#e2e8f0">'
-                f'· {html_lib.escape(p["name"])}'
-                f'<span style="color:#64748b">{html_lib.escape(detail)}</span></div>'
+                f'· <b style="color:#86efac">{html_lib.escape(p["name"])}</b>'
+                f'<span style="color:#64748b;font-size:0.73rem">{html_lib.escape(detail)}</span></div>'
             )
     else:
-        params_html = '<div style="font-size:0.78rem;color:#64748b">No parameters identified yet.</div>'
+        params_html = '<div style="font-size:0.78rem;color:#475569;font-style:italic">None yet</div>'
 
     loops_html = ""
     if st.session_state.loops:
@@ -618,44 +840,48 @@ with info_col:
                 f'<div style="margin-bottom:8px;padding:7px 9px;'
                 f'border-left:3px solid {color};border-radius:4px;'
                 f'background:rgba(255,255,255,0.04)">'
-                f'<span style="font-weight:700;color:{color};font-size:0.82rem">{name}</span> '
+                f'<span style="font-weight:700;color:{color};font-size:0.84rem">{name}</span> '
                 f'<span style="font-size:0.74rem;color:#64748b">({loop_type})</span><br>'
                 f'<span style="font-size:0.74rem;line-height:1.6;color:#cbd5e1">{path}</span>'
                 f'</div>'
             )
     else:
-        loops_html = '<div style="font-size:0.78rem;color:#64748b">No loops identified yet.</div>'
+        loops_html = '<div style="font-size:0.78rem;color:#475569;font-style:italic">None yet</div>'
+
+    n_s = len(st.session_state.stocks)
+    n_f = len(st.session_state.flows)
+    n_p = len(st.session_state.parameters)
+    n_l = len(st.session_state.loops)
 
     st.markdown(
         f'<div class="info-scroll">'
-        f'<div style="font-size:0.7rem;font-weight:700;letter-spacing:0.06em;'
-        f'color:#93c5fd;text-transform:uppercase;margin-bottom:6px">Stocks</div>'
+        # Stocks header + count badge
+        f'<div style="display:flex;align-items:center;margin-bottom:6px">'
+        f'<span style="font-size:0.7rem;font-weight:700;letter-spacing:0.06em;'
+        f'color:#93c5fd;text-transform:uppercase">Stocks</span>'
+        f'{_count_badge(n_s, "#93c5fd")}</div>'
         f'{stocks_html}'
-        f'<div style="margin:10px 0 6px;font-size:0.7rem;font-weight:700;'
-        f'letter-spacing:0.06em;color:#fbbf24;text-transform:uppercase">Flows</div>'
+        # Flows header + count badge
+        f'<div style="display:flex;align-items:center;margin:12px 0 6px">'
+        f'<span style="font-size:0.7rem;font-weight:700;letter-spacing:0.06em;'
+        f'color:#fbbf24;text-transform:uppercase">Flows</span>'
+        f'{_count_badge(n_f, "#fbbf24")}</div>'
         f'{flows_html}'
-        f'<div style="margin:10px 0 6px;font-size:0.7rem;font-weight:700;'
-        f'letter-spacing:0.06em;color:#86efac;text-transform:uppercase">Parameters</div>'
+        # Parameters header + count badge
+        f'<div style="display:flex;align-items:center;margin:12px 0 6px">'
+        f'<span style="font-size:0.7rem;font-weight:700;letter-spacing:0.06em;'
+        f'color:#86efac;text-transform:uppercase">Parameters</span>'
+        f'{_count_badge(n_p, "#86efac")}</div>'
         f'{params_html}'
-        f'<div style="margin:10px 0 6px;font-size:0.7rem;font-weight:700;'
-        f'letter-spacing:0.06em;color:#60a5fa;text-transform:uppercase">Feedback Loops</div>'
+        # Feedback loops header + count badge
+        f'<div style="display:flex;align-items:center;margin:12px 0 6px">'
+        f'<span style="font-size:0.7rem;font-weight:700;letter-spacing:0.06em;'
+        f'color:#60a5fa;text-transform:uppercase">Feedback Loops</span>'
+        f'{_count_badge(n_l, "#60a5fa")}</div>'
         f'{loops_html}'
         f'</div>',
         unsafe_allow_html=True,
     )
-
-    st.divider()
-    with st.expander("Debug: last LLM extraction", expanded=False):
-        if st.session_state.last_response_debug:
-            d = st.session_state.last_response_debug
-            st.markdown("**Scratchpad:**")
-            st.caption(d["scratchpad"])
-            st.markdown(f"**stocks:** `{d['extracted_stocks']}`")
-            st.markdown(f"**flows:** `{d['extracted_flows']}`")
-            st.markdown(f"**parameters:** `{d['extracted_parameters']}`")
-            st.markdown(f"**loops:** `{d['extracted_loops']}`")
-        else:
-            st.caption("No response yet.")
 
 # ── Left column: chat ─────────────────────────────────────────────────────────
 with chat_col:
